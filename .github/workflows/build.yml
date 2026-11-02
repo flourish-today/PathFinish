@@ -1,0 +1,102 @@
+name: Build PathFinish
+
+# Daily: if StreetComplete has a new release, or pathfinish.patch changed, build it with the patch applied.
+# Release tags are the StreetComplete tag plus the start of the patch's git hash, e.g. v64.1-1a2b3c4.
+# The build job has no secrets. Signing and publishing wait for approval in the "release" environment.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      release: ${{ steps.tag.outputs.release }}
+      new: ${{ steps.tag.outputs.new }}
+    steps:
+      - id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh api repos/streetcomplete/StreetComplete/releases/latest --jq .tag_name)
+          patch=$(gh api "repos/$GITHUB_REPOSITORY/contents/pathfinish.patch?ref=$GITHUB_SHA" --jq .sha)
+          release="$tag-${patch:0:7}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+          if gh release view "$release" -R "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.new == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: pf
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: streetcomplete/StreetComplete
+          ref: ${{ needs.check.outputs.tag }}
+          path: sc
+          persist-credentials: false
+      - name: Apply patch
+        run: git -C sc apply ../pf/pathfinish.patch
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Build
+        working-directory: sc
+        run: |
+          # Throwaway key so the release build can finish; the release job replaces the signature.
+          keytool -genkeypair -keystore throwaway.jks -storepass throwaway -keypass throwaway \
+            -alias throwaway -keyalg RSA -keysize 2048 -validity 1 -dname CN=throwaway
+          printf 'storeFile=../throwaway.jks\nstorePassword=throwaway\nkeyAlias=throwaway\nkeyPassword=throwaway\n' > keystore.properties
+          ./gradlew --no-daemon :androidApp:assembleRelease
+          cp androidApp/build/outputs/apk/release/androidApp-release.apk ../PathFinish.apk
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: apk
+          path: PathFinish.apk
+          retention-days: 7
+
+  release:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: apk
+      - name: Sign and publish
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.release }}
+          SC_TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > key.p12
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
+          "$apksigner" sign --ks key.p12 --ks-type PKCS12 --ks-pass env:KEY_PASSWORD --key-pass env:KEY_PASSWORD \
+            --out "PathFinish-$TAG.apk" PathFinish.apk
+          rm key.p12
+          "$apksigner" verify --print-certs "PathFinish-$TAG.apk"
+          sha256sum "PathFinish-$TAG.apk" > "PathFinish-$TAG.apk.sha256"
+          gh release create "$TAG" "PathFinish-$TAG.apk" "PathFinish-$TAG.apk.sha256" -R "$GITHUB_REPOSITORY" \
+            --title "PathFinish $TAG" --notes "Security-focused fork of StreetComplete $SC_TAG."
